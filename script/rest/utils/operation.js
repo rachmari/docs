@@ -1,259 +1,187 @@
-const { get, flatten, isPlainObject } = require('lodash')
-const { sentenceCase } = require('change-case')
-const slugger = new (require('github-slugger'))()
-const httpStatusCodes = require('http-status-code')
-const renderContent = require('../../../lib/render-content')
-const createCodeSamples = require('./create-code-samples')
-const Ajv = require('ajv')
+#!/usr/bin/env node
+import Ajv from 'ajv'
+import httpStatusCodes from 'http-status-code'
+import { readFile } from 'fs/promises'
+import { get, isPlainObject } from 'lodash-es'
+import { parseTemplate } from 'url-template'
 
-// titles that can't be derived by sentence-casing the ID
-const categoryTitles = { scim: 'SCIM' }
+import renderContent from '../../../lib/render-content/index.js'
+import getCodeSamples from './create-rest-examples.js'
+import operationSchema from './operation-schema.js'
+import { getBodyParams } from './get-body-params.js'
 
-module.exports = class Operation {
-  constructor (verb, requestPath, props, serverUrl) {
-    const defaultProps = {
-      parameters: [],
-      'x-codeSamples': [],
-      responses: {}
+const { operationUrls } = JSON.parse(
+  await readFile('script/rest/utils/rest-api-overrides.json', 'utf8')
+)
+
+export default class Operation {
+  #operation
+  constructor(verb, requestPath, operation, globalServers) {
+    this.#operation = operation
+    // The global server object sets metadata including the base url for
+    // all operations in a version. Individual operations can override
+    // the global server url at the operation level.
+    this.serverUrl = operation.servers ? operation.servers[0].url : globalServers[0].url
+
+    const serverVariables = operation.servers
+      ? operation.servers[0].variables
+      : globalServers[0].variables
+    if (serverVariables) {
+      const templateVariables = {}
+      Object.keys(serverVariables).forEach(
+        (key) => (templateVariables[key] = serverVariables[key].default)
+      )
+      this.serverUrl = parseTemplate(this.serverUrl).expand(templateVariables)
     }
 
-    Object.assign(this, { verb, requestPath, serverUrl }, defaultProps, props)
+    this.serverUrl = this.serverUrl.replace('http:', 'http(s):')
 
-    slugger.reset()
-    this.slug = slugger.slug(this.summary)
+    // Attach some global properties to the operation object to use
+    // during processing
+    this.#operation.serverUrl = this.serverUrl
+    this.#operation.requestPath = requestPath
+    this.#operation.verb = verb
 
-    // Add category
-    // workaround for misnamed `code-scanning.` category bug
-    // https://github.com/github/rest-api-description/issues/38
-    this['x-github'].category = this['x-github'].category.replace('.', '')
-    this.category = this['x-github'].category
-    this.categoryLabel = categoryTitles[this.category] || sentenceCase(this.category)
-
-    // Add subcategory
-    if (this['x-github'].subcategory) {
-      this.subcategory = this['x-github'].subcategory
-      this.subcategoryLabel = sentenceCase(this.subcategory)
-    }
-
+    this.verb = verb
+    this.requestPath = requestPath
+    this.title = operation.summary
+    this.setCategories()
+    this.parameters = operation.parameters || []
+    this.bodyParameters = []
+    this.enabledForGitHubApps = operation['x-github'].enabledForGitHubApps
+    this.codeExamples = getCodeSamples(this.#operation)
     return this
   }
 
-  get schema () {
-    return require('./operation-schema')
+  setCategories() {
+    const operationId = this.#operation.operationId
+    const xGithub = this.#operation['x-github']
+    // Set category
+    // A temporary override file allows us to override the category defined in
+    // the openapi schema. Without it, we'd have to update several
+    // @documentation_urls in the api code every time we move
+    // an endpoint to a new page.
+    this.category = operationUrls[operationId]
+      ? operationUrls[operationId].category
+      : xGithub.category
+
+    // Set subcategory
+    // A temporary override file allows us to override the subcategory
+    // defined in the openapi schema. Without it, we'd have to update several
+    // @documentation_urls in the api code every time we move
+    // an endpoint to a new page.
+    if (operationUrls[operationId]) {
+      if (operationUrls[operationId].subcategory) {
+        this.subcategory = operationUrls[operationId].subcategory
+      }
+    } else if (xGithub.subcategory) {
+      this.subcategory = xGithub.subcategory
+    }
   }
 
-  async process () {
-    this['x-codeSamples'] = createCodeSamples(this)
-
+  async process() {
     await Promise.all([
       this.renderDescription(),
-      this.renderCodeSamples(),
-      this.renderResponses(),
+      this.renderStatusCodes(),
       this.renderParameterDescriptions(),
       this.renderBodyParameterDescriptions(),
+      this.renderExampleResponseDescriptions(),
       this.renderPreviewNotes(),
-      this.renderNotes()
     ])
 
     const ajv = new Ajv()
-    const valid = ajv.validate(this.schema, this)
+    const valid = ajv.validate(operationSchema, this)
     if (!valid) {
       console.error(JSON.stringify(ajv.errors, null, 2))
-      throw new Error('Invalid operation found')
+      throw new Error('Invalid OpenAPI operation found')
     }
   }
 
-  async renderDescription () {
-    this.descriptionHTML = await renderContent(this.description)
+  getExternalDocs() {
+    return this.#operation.externalDocs
+  }
+
+  async renderDescription() {
+    this.descriptionHTML = await renderContent(this.#operation.description)
     return this
   }
 
-  async renderCodeSamples () {
-    return Promise.all(this['x-codeSamples'].map(async (sample) => {
-      const markdown = createCodeBlock(sample.source, sample.lang.toLowerCase())
-      sample.html = await renderContent(markdown)
-      return sample
-    }))
-  }
-
-  async renderResponses () {
-    // clone and delete this.responses so we can turn it into a clean array of objects
-    const rawResponses = JSON.parse(JSON.stringify(this.responses))
-    delete this.responses
-
-    this.responses = await Promise.all(Object.keys(rawResponses).map(async (responseCode) => {
-      const rawResponse = rawResponses[responseCode]
-      const httpStatusCode = responseCode
-      const httpStatusMessage = httpStatusCodes.getMessage(Number(responseCode))
-
-      const cleanResponses = []
-
-      // responses can have zero, one, or multiple examples
-      const rawExample = get(rawResponse, 'content.application/json.example')
-      const rawExamples = get(rawResponse, 'content.application/json.examples')
-
-      // first handle responses with multiple examples
-      if (rawExamples) {
-        for (const rawExampleKey of Object.keys(rawExamples)) {
-          const rawExample = rawExamples[rawExampleKey]
-          const cleanResponse = {}
-
-          cleanResponse.httpStatusCode = httpStatusCode
-          cleanResponse.httpStatusMessage = httpStatusMessage
-
-          // a handful of examples don't have summary properties with a description,
-          // so we can sentence case the property name as a fallback
-          cleanResponse.description = rawExample.summary || sentenceCase(rawExampleKey)
-
-          const payloadMarkdown = createCodeBlock(rawExample.value, 'json')
-          cleanResponse.payload = await renderContent(payloadMarkdown)
-
-          cleanResponses.push(cleanResponse)
-        }
-      } else { // then handle responses with either one or zero examples
-        const cleanResponse = {}
-
-        cleanResponse.httpStatusCode = responseCode
-        cleanResponse.httpStatusMessage = httpStatusCodes.getMessage(Number(responseCode))
-        cleanResponse.description = sentenceCase(rawResponse.description)
-
-        if (rawExample) {
-          const payloadMarkdown = createCodeBlock(rawExample, 'json')
-          cleanResponse.payload = await renderContent(payloadMarkdown)
-        }
-
-        cleanResponses.push(cleanResponse)
-      }
-
-      // tidy up descriptions
-      return cleanResponses.map(response => {
-        response.description = response.description
-          .replace('Example of', 'Response for')
-          .replace('Empty response', 'Default Response')
-          .replace(/^Default$/, 'Default response')
-        return response
+  async renderExampleResponseDescriptions() {
+    return Promise.all(
+      this.codeExamples.map(async (codeExample) => {
+        codeExample.response.description = await renderContent(codeExample.response.description)
+        return codeExample
       })
-    }))
-
-    // flatten child arrays
-    this.responses = flatten(this.responses)
+    )
   }
 
-  async renderParameterDescriptions () {
-    return Promise.all(this.parameters.map(async (param) => {
-      param.descriptionHTML = await renderContent(param.description)
-      return param
-    }))
+  async renderStatusCodes() {
+    const responses = this.#operation.responses
+    const responseKeys = Object.keys(responses)
+    if (responseKeys.length === 0) return []
+
+    this.statusCodes = await Promise.all(
+      responseKeys.map(async (responseCode) => {
+        const response = responses[responseCode]
+        const httpStatusCode = responseCode
+        const httpStatusMessage = httpStatusCodes.getMessage(Number(responseCode), 'HTTP/2')
+        // The OpenAPI should be updated to provide better descriptions, but
+        // until then, we can catch some known generic descriptions and replace
+        // them with the default http status message.
+        const responseDescription =
+          response.description.toLowerCase() === 'response'
+            ? await renderContent(httpStatusMessage)
+            : await renderContent(response.description)
+
+        return {
+          httpStatusCode,
+          description: responseDescription,
+        }
+      })
+    )
   }
 
-  async renderBodyParameterDescriptions () {
-    const bodyParamsObject = get(this, 'requestBody.content.application/json.schema.properties', {})
-    const requiredParams = get(this, 'requestBody.content.application/json.schema.required', [])
-
-    this.bodyParameters = await getBodyParams(bodyParamsObject, requiredParams)
+  async renderParameterDescriptions() {
+    return Promise.all(
+      this.parameters.map(async (param) => {
+        param.description = await renderContent(param.description)
+        return param
+      })
+    )
   }
 
-  async renderPreviewNotes () {
-    const previews = get(this, 'x-github.previews', [])
-      .filter(preview => preview.note)
-
-    return Promise.all(previews.map(async (preview) => {
-      const note = preview.note
-        // remove extra leading and trailing newlines
-        .replace(/```\n\n\n/mg, '```\n')
-        .replace(/```\n\n/mg, '```\n')
-        .replace(/\n\n\n```/mg, '\n```')
-        .replace(/\n\n```/mg, '\n```')
-
-        // convert single-backtick code snippets to fully fenced triple-backtick blocks
-        // example: This is the description.\n\n`application/vnd.github.machine-man-preview+json`
-        .replace(/\n`application/, '\n```\napplication')
-        .replace(/json`$/, 'json\n```')
-      preview.html = await renderContent(note)
-    }))
-  }
-
-  // add additional notes to this array whenever we want
-  async renderNotes () {
-    this.notes = []
-
-    return Promise.all(this.notes.map(async (note) => renderContent(note)))
-  }
-}
-
-// need to use this function recursively to get child and grandchild params
-async function getBodyParams (paramsObject, requiredParams) {
-  if (!isPlainObject(paramsObject)) return []
-
-  return Promise.all(Object.keys(paramsObject).map(async (paramKey) => {
-    const param = paramsObject[paramKey]
-    param.name = paramKey
-    param.in = 'body'
-    param.rawType = param.type
-    param.rawDescription = param.description
-
-    // e.g. array of strings
-    param.type = param.type === 'array'
-      ? `array of ${param.items.type}s`
-      : param.type
-
-    // e.g. object or null
-    param.type = param.nullable
-      ? `${param.type} or null`
-      : param.type
-
-    const isRequired = requiredParams && requiredParams.includes(param.name)
-    const requiredString = isRequired ? '**Required**. ' : ''
-    param.description = await renderContent(requiredString + param.description)
-
-    // there may be zero, one, or multiple object parameters that have children parameters
-    param.childParamsGroups = []
-    const childParamsGroup = await getChildParamsGroup(param)
-
-    if (childParamsGroup && childParamsGroup.params.length) {
-      param.childParamsGroups.push(childParamsGroup)
+  async renderBodyParameterDescriptions() {
+    if (!this.#operation.requestBody) return []
+    // There is currently only one operation with more than one content type
+    // and the request body parameter types are the same for both.
+    // Operation Id: markdown/render-raw
+    const contentType = Object.keys(this.#operation.requestBody.content)[0]
+    const schema = get(this.#operation, `requestBody.content.${contentType}.schema`, {})
+    // TODO: Remove this check
+    if (this.#operation.operationId === 'checks/create') {
+      delete schema.oneOf
     }
 
-    // if the param is an object, it may have child object params that have child params :/
-    if (param.rawType === 'object') {
-      param.childParamsGroups.push(...flatten(childParamsGroup.params
-        .filter(param => param.childParamsGroups.length)
-        .map(param => param.childParamsGroups)))
-    }
-
-    return param
-  }))
-}
-
-async function getChildParamsGroup (param) {
-  // only objects and arrays of objects ever have child params
-  if (!(param.rawType === 'array' || param.rawType === 'object')) return
-  if (param.items && param.items.type !== 'object') return
-
-  const childParamsObject = param.rawType === 'array' ? param.items.properties : param.properties
-  const requiredParams = param.rawType === 'array' ? param.items.required : param.required
-  const childParams = await getBodyParams(childParamsObject, requiredParams)
-
-  // adjust the type for easier readability in the child table
-  const parentType = param.rawType === 'array' ? 'items' : param.rawType
-
-  // add an ID to the child table so they can be linked to
-  slugger.reset()
-  const id = slugger.slug(`${param.name}-${parentType}`)
-
-  return {
-    parentName: param.name,
-    parentType,
-    id,
-    params: childParams
-  }
-}
-
-function createCodeBlock (input, language) {
-  // stringify JSON if needed
-  if (language === 'json' && typeof input !== 'string') {
-    input = JSON.stringify(input, null, 2)
+    this.bodyParameters = isPlainObject(schema) ? await getBodyParams(schema, true) : []
   }
 
-  return ['```' + language, input, '```'].join('\n')
+  async renderPreviewNotes() {
+    const previews = get(this.#operation, 'x-github.previews', [])
+    this.previews = await Promise.all(
+      previews.map(async (preview) => {
+        const note = preview.note
+          // remove extra leading and trailing newlines
+          .replace(/```\n\n\n/gm, '```\n')
+          .replace(/```\n\n/gm, '```\n')
+          .replace(/\n\n\n```/gm, '\n```')
+          .replace(/\n\n```/gm, '\n```')
+
+          // convert single-backtick code snippets to fully fenced triple-backtick blocks
+          // example: This is the description.\n\n`application/vnd.github.machine-man-preview+json`
+          .replace(/\n`application/, '\n```\napplication')
+          .replace(/json`$/, 'json\n```')
+        return await renderContent(note)
+      })
+    )
+  }
 }
