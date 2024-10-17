@@ -26,7 +26,7 @@ If you're looking for a way to contribute, you can scan through our [help wanted
 ### And that's it!
 
 If you're having trouble with your GitHub account, contact [Support](https://support.github.com).
-
+ 
 That's how you can easily become a member of the GitHub Docs community. :sparkles:
 
 ## READMEs
